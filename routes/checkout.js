@@ -395,7 +395,7 @@ async function createPartialCodOrder({
 }) {
   const lineItems = (cart?.items || []).map((item) => {
     const isGoldCoin = String(item.variantId || "").includes("47753346973914") || String(item.variantId || "").includes("47661824082138");
-    const isSilverPendant = String(item.variantId || "").includes("48052809498842");
+    const isSilverPendant = String(item.variantId || "").includes("48052809498842") || String(item.variantId || "").includes("48335367602394");
     const isFreeGift = isGoldCoin || isSilverPendant;
     const numericVariantId = isGoldCoin ? null : getNumericShopifyId(item.variantId);
     const price = isFreeGift ? 0 : Number(item.price || 0);
@@ -539,6 +539,8 @@ async function routes(fastify, options) {
       const GOLDCOIN_100MG = "gid://shopify/ProductVariant/47661824082138";
       const GOLDCOIN_500MG = "gid://shopify/ProductVariant/47753346973914";
       const SILVER_PENDANT_VARIANT_ID = "gid://shopify/ProductVariant/48052809498842";
+      const PENDANT_5K_VARIANT_ID = "gid://shopify/ProductVariant/48335367602394";
+      const isPendantVariant = (id) => id === SILVER_PENDANT_VARIANT_ID || id === PENDANT_5K_VARIANT_ID;
       const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
 
       const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG];
@@ -699,16 +701,17 @@ async function routes(fastify, options) {
         const diamondTotalForSilverPendant = diamondTotal;
 
         const eligibleGoldCoinQty = isGoldCoinEnabled ? Math.floor(diamondTotalForGoldCoin / goldCoinThreshold) : 0;
-        const SILVER_PENDANT_THRESHOLD = 30000;
-        const eligibleSilverPendantQty = diamondTotalForSilverPendant >= SILVER_PENDANT_THRESHOLD ? 1 : 0;
+        const eligiblePendantId = diamondTotalForSilverPendant >= 30000 
+          ? SILVER_PENDANT_VARIANT_ID 
+          : (diamondTotalForSilverPendant >= 15000 ? PENDANT_5K_VARIANT_ID : null);
         
-        console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Silver Pendant(Qty=${eligibleSilverPendantQty}), DiamondTotal=${diamondTotalForSilverPendant}`);
+        console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Silver Pendant(${eligiblePendantId}), DiamondTotal=${diamondTotalForSilverPendant}`);
 
         // Second pass: Validate Gift items
         cart.items = cart.items.map(item => {
           const vId = normalizeVariantId(item.variantId);
           const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
-          const isSilverPendant = vId === SILVER_PENDANT_VARIANT_ID;
+          const isSilverPendant = isPendantVariant(vId);
 
           if (isGoldCoin) {
             if (!isGoldCoinEnabled || eligibleGoldCoinQty <= 0) {
@@ -720,8 +723,8 @@ async function routes(fastify, options) {
           }
 
           if (isSilverPendant) {
-            if (eligibleSilverPendantQty <= 0) {
-              console.warn(`[Security] Removing unauthorized Silver Pendant from cart. Threshold not met.`);
+            if (!eligiblePendantId || vId !== eligiblePendantId) {
+              console.warn(`[Security] Removing unauthorized Silver Pendant from cart. Threshold not met or wrong tier.`);
               return null;
             }
             // Max 1 silver pendant
@@ -773,7 +776,7 @@ async function routes(fastify, options) {
               const subtotalForCoupon = cart.items.reduce((acc, item) => {
                 const vId = normalizeVariantId(item.variantId);
                 const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
-                const isSilverPendant = vId === SILVER_PENDANT_VARIANT_ID;
+                const isSilverPendant = isPendantVariant(vId);
                 if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
                   return acc;
                 }
@@ -806,7 +809,7 @@ async function routes(fastify, options) {
                     targetSubtotalForCoupon = cart.items.reduce((acc, item) => {
                       const vId = normalizeVariantId(item.variantId);
                       const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
-                      const isSilverPendant = vId === SILVER_PENDANT_VARIANT_ID;
+                      const isSilverPendant = isPendantVariant(vId);
                       if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
                         return acc;
                       }
@@ -912,16 +915,16 @@ async function routes(fastify, options) {
 
       // Dynamically fetch Silver Pendant price from Shopify if present in cart
       let silverPendantLivePrice = 0;
-      const hasSilverPendant = cart.items.some(item => normalizeVariantId(item.variantId) === SILVER_PENDANT_VARIANT_ID);
-      if (hasSilverPendant) {
+      const activePendant = cart.items.find(item => isPendantVariant(normalizeVariantId(item.variantId)));
+      if (activePendant) {
         try {
           const pQuery = `query ($id: ID!) { node(id: $id) { ... on ProductVariant { price compareAtPrice } } }`;
-          const pData = await shopifyAdminFetch(pQuery, { id: SILVER_PENDANT_VARIANT_ID });
+          const pData = await shopifyAdminFetch(pQuery, { id: normalizeVariantId(activePendant.variantId) });
           if (pData?.node) {
             silverPendantLivePrice = Number(pData.node.price || pData.node.compareAtPrice || 0);
           }
-        } catch (err) {
-          console.error("Failed to fetch live silver pendant price in checkout:", err.message);
+        } catch (e) {
+          console.error("Failed to fetch live price for active pendant:", e.message);
         }
       }
 
@@ -929,7 +932,7 @@ async function routes(fastify, options) {
       const lineItems = cart.items.map(item => {
         const vId = normalizeVariantId(item.variantId);
         const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
-        const isSilverPendant = vId === SILVER_PENDANT_VARIANT_ID;
+        const isSilverPendant = isPendantVariant(vId);
         
         const finalPriceValue = Number(item.finalPrice || 0);
         const storefrontPrice = Number(item.price || 0);
