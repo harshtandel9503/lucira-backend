@@ -395,8 +395,7 @@ async function createPartialCodOrder({
 }) {
   const lineItems = (cart?.items || []).map((item) => {
     const isGoldCoin = String(item.variantId || "").includes("47753346973914") || String(item.variantId || "").includes("47661824082138");
-    const isSilverPendant = String(item.variantId || "").includes("48414958715098");
-    const isFreeGift = isGoldCoin || isSilverPendant;
+    const isFreeGift = isGoldCoin;
     const numericVariantId = isGoldCoin ? null : getNumericShopifyId(item.variantId);
     const price = isFreeGift ? 0 : Number(item.price || 0);
     const lineItem = {
@@ -538,8 +537,6 @@ async function routes(fastify, options) {
       // Supported Free Gift Variant IDs for security and display
       const GOLDCOIN_100MG = "gid://shopify/ProductVariant/47661824082138";
       const GOLDCOIN_500MG = "gid://shopify/ProductVariant/47753346973914";
-      const SILVER_BRACELET_VARIANT_ID = "gid://shopify/ProductVariant/48414958715098";
-      const isPendantVariant = (id) => id === SILVER_BRACELET_VARIANT_ID;
       const INSURANCE_VARIANT_ID = "gid://shopify/ProductVariant/47709366026458";
 
       const AUTHORIZED_GOLDCOINS = [GOLDCOIN_100MG];
@@ -697,20 +694,14 @@ async function routes(fastify, options) {
         // Gold coin and silver pendant eligibility share the same base: diamond
         // lines only, insurance excluded.
         const diamondTotalForGoldCoin = diamondTotal;
-        const diamondTotalForSilverPendant = diamondTotal;
-
         const eligibleGoldCoinQty = isGoldCoinEnabled ? Math.floor(diamondTotalForGoldCoin / goldCoinThreshold) : 0;
-        const eligiblePendantId = diamondTotalForSilverPendant >= 30000
-          ? SILVER_BRACELET_VARIANT_ID
-          : null;
 
-        console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), Silver Bracelet(${eligiblePendantId}), DiamondTotal=${diamondTotalForSilverPendant}`);
+        console.log(`[Security Check] Eligibility: Gold Coin(Qty=${eligibleGoldCoinQty}), DiamondTotal=${diamondTotalForGoldCoin}`);
 
         // Second pass: Validate Gift items
         cart.items = cart.items.map(item => {
           const vId = normalizeVariantId(item.variantId);
           const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
-          const isSilverPendant = isPendantVariant(vId);
 
           if (isGoldCoin) {
             if (!isGoldCoinEnabled || eligibleGoldCoinQty <= 0) {
@@ -719,15 +710,6 @@ async function routes(fastify, options) {
             }
             const validatedQty = Math.min(Number(item.quantity || 1), eligibleGoldCoinQty);
             return { ...item, price: 0, finalPrice: 0, quantity: validatedQty, isFreeGift: true };
-          }
-
-          if (isSilverPendant) {
-            if (!eligiblePendantId || vId !== eligiblePendantId) {
-              console.warn(`[Security] Removing unauthorized Silver Bracelet from cart. Threshold not met.`);
-              return null;
-            }
-            // Max 1 silver pendant
-            return { ...item, price: 0, finalPrice: 0, quantity: 1, isFreeGift: true };
           }
 
           return item;
@@ -775,8 +757,7 @@ async function routes(fastify, options) {
               const subtotalForCoupon = cart.items.reduce((acc, item) => {
                 const vId = normalizeVariantId(item.variantId);
                 const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
-                const isSilverPendant = isPendantVariant(vId);
-                if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
+                if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift)) {
                   return acc;
                 }
                 return acc + (Number(item.finalPrice || item.price || 0) * Number(item.quantity || 1));
@@ -808,8 +789,7 @@ async function routes(fastify, options) {
                     targetSubtotalForCoupon = cart.items.reduce((acc, item) => {
                       const vId = normalizeVariantId(item.variantId);
                       const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
-                      const isSilverPendant = isPendantVariant(vId);
-                      if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift) || (isSilverPendant && item.isFreeGift)) {
+                      if (vId === INSURANCE_VARIANT_ID || (isGoldCoin && item.isFreeGift)) {
                         return acc;
                       }
                       const rawId = item.shopifyId || item.productId || item.id;
@@ -911,31 +891,14 @@ async function routes(fastify, options) {
         console.error("Failed to lock secure checkout data:", lockError.message);
       }
       // --- END LOCK ---
-
-      // Dynamically fetch Silver Pendant price from Shopify if present in cart
-      let silverPendantLivePrice = 0;
-      const activePendant = cart.items.find(item => isPendantVariant(normalizeVariantId(item.variantId)));
-      if (activePendant) {
-        try {
-          const pQuery = `query ($id: ID!) { node(id: $id) { ... on ProductVariant { price compareAtPrice } } }`;
-          const pData = await shopifyAdminFetch(pQuery, { id: normalizeVariantId(activePendant.variantId) });
-          if (pData?.node) {
-            silverPendantLivePrice = Number(pData.node.price || pData.node.compareAtPrice || 0);
-          }
-        } catch (e) {
-          console.error("Failed to fetch live price for active pendant:", e.message);
-        }
-      }
-
       // Prepare line items
       const lineItems = cart.items.map(item => {
         const vId = normalizeVariantId(item.variantId);
         const isGoldCoin = AUTHORIZED_GOLDCOINS.some(id => String(vId).includes(id.replace("gid://shopify/ProductVariant/", "")));
-        const isSilverPendant = isPendantVariant(vId);
         
         const finalPriceValue = Number(item.finalPrice || 0);
         const storefrontPrice = Number(item.price || 0);
-        const price = (isGoldCoin || isSilverPendant) ? 0 : (finalPriceValue > 0 ? finalPriceValue : storefrontPrice);
+        const price = isGoldCoin ? 0 : (finalPriceValue > 0 ? finalPriceValue : storefrontPrice);
         
         const originalValue = Number(item.originalPrice || item.comparePrice || 0);
         const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
@@ -974,7 +937,7 @@ async function routes(fastify, options) {
 
         const lineItem = {
           quantity: Number(item.quantity || 1),
-          originalUnitPrice: isGoldCoin ? 0 : (isSilverPendant ? String(silverPendantLivePrice || unitPrice || 0) : unitPrice),
+          originalUnitPrice: isGoldCoin ? 0 : unitPrice,
           customAttributes: [
             { key: "_Gold Weight", value: String(item.goldWeight || "") },
             { key: "_Gold Price", value: String(item.goldPrice || "") },
@@ -1004,7 +967,7 @@ async function routes(fastify, options) {
         }
 
         // Only apply 100% discount if it's an authorized free gift
-        if ((price === 0 || isSilverPendant) && (isGoldCoin || isSilverPendant)) {
+        if (price === 0 && isGoldCoin) {
           lineItem.appliedDiscount = {
             title: "Free Gift",
             value: 100,
