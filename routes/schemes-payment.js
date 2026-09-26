@@ -45,11 +45,20 @@ module.exports = async function (fastify) {
   // POST /api/schemes/customer/get
   fastify.post('/customer/get', async (request, reply) => {
     try {
-      const { mobile } = request.body || {};
-      if (!mobile) return reply.code(400).send({ error: "Mobile number is required" });
+      const { mobile, email } = request.body || {};
+      if (!mobile && !email) return reply.code(400).send({ error: "Mobile number or email is required" });
 
-      const data = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { mobile });
-      return data;
+      let data = null;
+      if (mobile) {
+        data = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { mobile }).catch(() => null);
+      }
+
+      // If no customer found by mobile, and email is provided, fallback to email lookup
+      if ((!data || !data.Entities || data.Entities.length === 0) && email) {
+        data = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { email }).catch(() => null);
+      }
+
+      return data || { Entities: [], TotalCount: 0 };
     } catch (error) {
       return reply.code(error.status || 500).send({ error: error.message, details: error.details });
     }
@@ -60,12 +69,18 @@ module.exports = async function (fastify) {
     try {
       const payload = request.body || {};
       const mobile = payload.phone || payload.mobile;
+      const email = payload.email;
 
       // Fetch existing customer to preserve fields not sent from frontend
       let existing = {};
       if (mobile) {
         const getResponse = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { mobile }).catch(() => ({}));
-        existing = getResponse.Entity || (getResponse.Entities && getResponse.Entities[0]) || getResponse || {};
+        existing = getResponse.Entity || (getResponse.Entities && getResponse.Entities[0]) || {};
+      }
+      // If not found by mobile, check by email
+      if ((!existing.party_id && !existing.Id) && email) {
+        const getEmailRes = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { email }).catch(() => ({}));
+        existing = getEmailRes.Entity || (getEmailRes.Entities && getEmailRes.Entities[0]) || {};
       }
 
       const partyId = parseInt(payload.party_id || payload.id || existing.party_id || existing.Id || 0, 10);
@@ -78,24 +93,41 @@ module.exports = async function (fastify) {
           party_name: partyName,
           party_type: 9,
           party_sub_type: 6,
-          phone: mobile,
-          mobile: mobile,
+          phone: mobile || "",
+          mobile: mobile || "",
           country_id: 101,
           currency_id: 103,
-          email: payload.email || `${mobile}@lucira.internal`,
+          email: email || `${mobile}@lucira.internal`,
           address: payload.address || "",
           pin_code: pinCode,
           company_id: 1,
           tax_reg_type: 4,
           is_disabled: false,
         };
-        const created = await ornaverseFetch('/Services/POS/Customer/Create', 'POST', { Entity: newEntity });
-        const createdPartyId = created?.EntityId;
-        return {
-          ...created,
-          party_id: createdPartyId,
-          EntityId: createdPartyId,
-        };
+        try {
+          const created = await ornaverseFetch('/Services/POS/Customer/Create', 'POST', { Entity: newEntity });
+          const createdPartyId = created?.EntityId;
+          return {
+            ...created,
+            party_id: createdPartyId,
+            EntityId: createdPartyId,
+          };
+        } catch (createErr) {
+          // If Ornaverse indicates customer already exists (e.g. by email), recover their record
+          if (email) {
+            const getEmailRes = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { email }).catch(() => ({}));
+            const found = getEmailRes.Entity || (getEmailRes.Entities && getEmailRes.Entities[0]);
+            if (found && (found.party_id || found.Id)) {
+              const recoveredId = found.party_id || found.Id;
+              return {
+                EntityId: recoveredId,
+                party_id: recoveredId,
+                ...found,
+              };
+            }
+          }
+          throw createErr;
+        }
       }
 
       const partyName = `${payload.first_name || ''} ${payload.last_name || ''}`.trim() || existing.party_name || existing.PartyName || "Customer";
@@ -106,7 +138,7 @@ module.exports = async function (fastify) {
         mobile: mobile || existing.mobile || existing.Mobile || "",
         phone: mobile || existing.phone || existing.Phone || "",
         prefix: existing.prefix || "",
-        email: payload.email || existing.email || existing.Email || "",
+        email: email || existing.email || existing.Email || "",
         address: payload.address || existing.address || existing.Address || "",
         address_1: payload.address1 || existing.address_1 || existing.Address1 || "",
         state_id: existing.state_id,
@@ -162,11 +194,21 @@ module.exports = async function (fastify) {
     try {
       const payload = request.body || {};
       const mobile = payload.phone || payload.mobile;
-      if (!mobile) return reply.code(400).send({ error: "Mobile number is required" });
+      const email = payload.email;
+      if (!mobile && !email) return reply.code(400).send({ error: "Mobile number or email is required" });
 
-      // First check if customer already exists in Ornaverse
-      const getResponse = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { mobile }).catch(() => ({}));
-      const existing = getResponse?.Entity || (getResponse?.Entities && getResponse.Entities[0]);
+      // First check if customer already exists in Ornaverse by mobile
+      let existing = null;
+      if (mobile) {
+        const getResponse = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { mobile }).catch(() => ({}));
+        existing = getResponse?.Entity || (getResponse?.Entities && getResponse.Entities[0]);
+      }
+
+      // If not found by mobile, check by email
+      if ((!existing || !existing.party_id) && email) {
+        const getEmailRes = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { email }).catch(() => ({}));
+        existing = getEmailRes?.Entity || (getEmailRes?.Entities && getEmailRes.Entities[0]);
+      }
 
       if (existing && (existing.party_id || existing.Id)) {
         const existingPartyId = existing.party_id || existing.Id;
@@ -184,11 +226,11 @@ module.exports = async function (fastify) {
         party_name: partyName,
         party_type: 9,
         party_sub_type: 6,
-        phone: mobile,
-        mobile: mobile,
+        phone: mobile || "",
+        mobile: mobile || "",
         country_id: 101,
         currency_id: 103,
-        email: payload.email || `${mobile}@lucira.internal`,
+        email: email || `${mobile}@lucira.internal`,
         address: payload.address || "",
         pin_code: pinCode,
         company_id: 1,
@@ -196,14 +238,31 @@ module.exports = async function (fastify) {
         is_disabled: false,
       };
 
-      const data = await ornaverseFetch('/Services/POS/Customer/Create', 'POST', { Entity: entity });
-      const partyId = data?.EntityId;
+      try {
+        const data = await ornaverseFetch('/Services/POS/Customer/Create', 'POST', { Entity: entity });
+        const partyId = data?.EntityId;
 
-      return {
-        ...data,
-        party_id: partyId,
-        EntityId: partyId,
-      };
+        return {
+          ...data,
+          party_id: partyId,
+          EntityId: partyId,
+        };
+      } catch (createErr) {
+        // If Ornaverse still throws UniqueViolation on email, recover the existing customer
+        if (email) {
+          const getEmailRes = await ornaverseFetch('/Services/POS/Customer/GetCustomer', 'POST', { email }).catch(() => ({}));
+          const found = getEmailRes?.Entity || (getEmailRes?.Entities && getEmailRes.Entities[0]);
+          if (found && (found.party_id || found.Id)) {
+            const foundPartyId = found.party_id || found.Id;
+            return {
+              EntityId: foundPartyId,
+              party_id: foundPartyId,
+              ...found,
+            };
+          }
+        }
+        throw createErr;
+      }
     } catch (error) {
       return reply.code(error.status || 500).send({ error: error.message, details: error.details });
     }
