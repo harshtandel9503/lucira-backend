@@ -13,9 +13,14 @@ const {
   getCollectionIdOrder,
   orderIdsByStore,
 } = require('../lib/storeAvailability');
+const { getDiscountLookup } = require('../lib/discountIndex');
 
 const SORT_MAP = {
   manual: { sortKey: "MANUAL", reverse: false },
+  // Shopify has no discount key. Ordered by lib/discountIndex.js over the
+  // collection's Featured order (below); MANUAL is what the metadata query and
+  // the fallback use, so a fallback is honestly Featured, not a random order.
+  discount_desc: { sortKey: "MANUAL", reverse: false },
   best_selling: { sortKey: "BEST_SELLING", reverse: false },
   price_low_high: { sortKey: "PRICE", reverse: false },
   price_high_low: { sortKey: "PRICE", reverse: true },
@@ -92,6 +97,18 @@ const PRODUCTS_BY_IDS_QUERY = `
 // serving Shopify's own order. Tuned above a warm resolve (~single-digit ms) and
 // below the point a shopper reads the grid as broken.
 const STORE_ORDER_BUDGET_MS = Number(process.env.STORE_ORDER_BUDGET_MS) || 1500;
+// Same idea for "Discount: High to Low". Longer, because the shopper explicitly
+// asked for this order and a fallback shows Featured instead; the id scan it
+// waits on is pre-warmed for the large collections (warmCollectionIdOrders).
+const DISCOUNT_ORDER_BUDGET_MS = Number(process.env.DISCOUNT_ORDER_BUDGET_MS) || 4000;
+const DISCOUNT_SORT_ENABLED = process.env.DISCOUNT_SORT_ENABLED !== 'false';
+
+// An ordered view pages with a numeric offset; Shopify's cursors are opaque
+// base64. A request carrying a Shopify cursor belongs to a view whose FIRST page
+// fell back to Shopify paging, and must keep paging that way — reading it as an
+// offset (parseInt -> NaN -> 0) would restart the ordered list from the top and
+// mix two orders in one grid.
+const isOffsetCursor = (cursor) => cursor == null || cursor === '' || /^\d+$/.test(String(cursor));
 
 const collectionCountCache = new Map();
 const SHOP_PRICING_CACHE_TTL = 24 * 60 * 60 * 1000;
@@ -345,7 +362,25 @@ async function routes(fastify, options) {
         requestedStores.length > 0 &&
         handle !== "all" &&
         sort === "manual" &&
-        !STORE_COLLECTION_HANDLES.has(handle);
+        !STORE_COLLECTION_HANDLES.has(handle) &&
+        isOffsetCursor(cursor);
+
+      // ── Discount ordering ("Discount: High to Low") ─────────────────────────
+      // The collection's Featured order (filters applied, hidden removed),
+      // stably re-sorted by the card's discount % from lib/discountIndex.js, so
+      // equal discounts keep Featured order. Pincode plays no part here by
+      // decision: only the default sort is store-ordered. Pages are served by id
+      // with an offset cursor, exactly like the store path — the whole
+      // collection is ordered, not just each page. Any miss (index not loaded,
+      // scan too slow or capped, Shopify cursor) serves plain Featured paging.
+      const discountLookup =
+        sort === "discount_desc" && handle !== "all" && DISCOUNT_SORT_ENABLED && isOffsetCursor(cursor)
+          ? getDiscountLookup(handle)
+          : null;
+      if (sort === "discount_desc" && DISCOUNT_SORT_ENABLED && handle !== "all" && isOffsetCursor(cursor) && !discountLookup) {
+        console.warn(`Discount index not loaded yet, serving Featured order for "${handle}"`);
+      }
+      let useDiscountOrder = !!discountLookup;
 
       // Resolved BEFORE the main product fetch on purpose. The reordered page is
       // fetched by id, so this call needs to know up front whether to ask Shopify
@@ -398,10 +433,44 @@ async function routes(fastify, options) {
         }
       }
 
-      // In store-order mode the cursor is an offset into our own ordered list
+      if (useDiscountOrder) {
+        try {
+          const TIMED_OUT = Symbol("discount-order-timeout");
+          const scan = getCollectionIdOrder(handle, SORT_MAP.manual, finalFilters);
+          scan.catch(() => {}); // losing the race must not become an unhandled rejection
+          let budgetTimer;
+          const budget = new Promise((resolve) => {
+            budgetTimer = setTimeout(() => resolve(TIMED_OUT), DISCOUNT_ORDER_BUDGET_MS);
+          });
+          const raced = await Promise.race([scan, budget]);
+          clearTimeout(budgetTimer);
+
+          if (raced === TIMED_OUT) {
+            console.warn(
+              `Discount ordering exceeded ${DISCOUNT_ORDER_BUDGET_MS}ms for "${handle}", serving Featured order (scan continues into cache)`
+            );
+            useDiscountOrder = false;
+          } else if (raced.capped || !raced.ids.length) {
+            useDiscountOrder = false;
+          } else {
+            orderedIds = raced.ids
+              .map((id, i) => ({ id, i, d: discountLookup(id) }))
+              .sort((a, b) => b.d - a.d || a.i - b.i)
+              .map((x) => x.id);
+          }
+        } catch (e) {
+          console.error("Discount ordering unavailable, serving Featured order:", e?.message);
+          useDiscountOrder = false;
+        }
+      }
+
+      // Either ordering mode serves pages by id from `orderedIds`.
+      const useIdOrder = (useStoreOrder || useDiscountOrder) && !!orderedIds;
+
+      // In id-order mode the cursor is an offset into our own ordered list
       // rather than an opaque Shopify cursor. The frontend only ever echoes back
       // whatever endCursor it was handed, so this round-trips with no client change.
-      const storeOffset = useStoreOrder ? Math.max(0, parseInt(cursor, 10) || 0) : 0;
+      const storeOffset = useIdOrder ? Math.max(0, parseInt(cursor, 10) || 0) : 0;
 
       try {
         let storefrontData;
@@ -426,7 +495,7 @@ async function routes(fastify, options) {
             reverse: sortConfig.reverse,
             query: filterQuery.trim() || null,
           });
-        } else if (useStoreOrder) {
+        } else if (useIdOrder) {
           // In store-order mode this request is only for the collection's own
           // metadata and its facet list — `filters` on the connection describes
           // the whole filtered set, not the page, which is why one product is
@@ -468,7 +537,7 @@ async function routes(fastify, options) {
         // Swap in the store-ordered page. Everything downstream — variant configs,
         // the product transform, facets, totals — runs on this exactly as it does
         // on a Shopify page, because the shape is identical.
-        if (useStoreOrder && orderedIds && productsData) {
+        if (useIdOrder && productsData) {
           const pageIds = orderedIds.slice(storeOffset, storeOffset + pageSize);
           let nodes = [];
           if (pageIds.length) {

@@ -2,7 +2,8 @@
  * Webhooks Route (Fastify)
  */
 const { clearAllCache } = require('../lib/cache');
-const { warmStoreProductIds } = require('../lib/storeAvailability');
+const { warmStoreProductIds, warmCollectionIdOrders } = require('../lib/storeAvailability');
+const { noteProductChanged, noteInventoryItemChanged } = require('../lib/discountIndex');
 const crypto = require('crypto');
 const returnsLib = require('../lib/returns');
 
@@ -126,6 +127,10 @@ async function routes(fastify, options) {
       // 3. Clear all backend memory caches — rate-limited, see scheduleCacheClear.
       scheduleCacheClear(handle || "unknown");
 
+      // "Discount: High to Low" index — debounced, batched re-read of just this
+      // product (a large burst becomes one full rebuild). See lib/discountIndex.js.
+      noteProductChanged(payload.admin_graphql_api_id || payload.id);
+
       // 4. Debounced Frontend Revalidation
       // ---------------------------------------------------------------------------
       // PROBLEM: During a daily bulk price update, Shopify fires 2,500 webhooks in 
@@ -233,6 +238,9 @@ async function routes(fastify, options) {
     try {
       // 3. Clear backend memory caches with rate-limiting & cooldown (store-availability, collection sorting, counts)
       scheduleCacheClear(`inventory:${topic}`);
+
+      // Stock decides which variant the card prices, so it can move the discount.
+      noteInventoryItemChanged(itemId);
 
       // 4. Debounced Frontend ISR Revalidation (homepage and store availability)
       scheduleRevalidation(null);
@@ -509,6 +517,7 @@ function scheduleCacheClear(reason) {
     // ordering. Rebuild them right away, off the request path, so the next
     // pincoded shopper gets a warm ordering instead of paying for the scans.
     warmStoreProductIds();
+    warmCollectionIdOrders();
   } else {
     suppressedClears += 1;
   }
@@ -523,6 +532,7 @@ function scheduleCacheClear(reason) {
     );
     suppressedClears = 0;
     warmStoreProductIds();
+    warmCollectionIdOrders();
   }, CACHE_CLEAR_TRAILING_MS);
 }
 

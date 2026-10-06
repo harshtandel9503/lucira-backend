@@ -2,7 +2,8 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { clearAllCache } = require('./lib/cache');
-const { warmStoreProductIds } = require('./lib/storeAvailability');
+const { warmStoreProductIds, warmCollectionIdOrders } = require('./lib/storeAvailability');
+const { startDiscountIndex, discountIndexStatus } = require('./lib/discountIndex');
 const { startRecoScheduler } = require('./lib/recoScheduler');
 const { startSmartSortScheduler } = require('./lib/smartSortScheduler');
 const { startDiamondShapeScheduler } = require('./lib/diamondShapeScheduler');
@@ -63,7 +64,8 @@ fastify.get('/health', async () => {
     // costs. Here so a throttle can be diagnosed from the outside without
     // adding logging or attaching to the process.
     shopify: governorStats(),
-    skuIndex: skuIndexStatus()
+    skuIndex: skuIndexStatus(),
+    discountIndex: discountIndexStatus()
   };
 });
 
@@ -191,6 +193,13 @@ const start = async () => {
     // it can never reject — no relation to the Admin cost bucket that the SKU
     // warm-up below has to be careful about.
     warmStoreProductIds();
+    // Featured id orders of the big collections: read by the pincode ordering
+    // and by "Discount: High to Low". Detached, never rejects.
+    warmCollectionIdOrders();
+    // The discount index: one Mongo read on a normal boot; a background
+    // Storefront walk (~45s) only when there is no fresh stored copy.
+    startDiscountIndex(fastify.mongo.db).catch((err) =>
+      console.error('[DiscountIndex] start failed (Discount sort will serve Featured order):', err.message));
 
     // Warm the variant-SKU index: GA4 item ids are mostly variant SKUs, and
     // everything that reads GA (previews, stats refreshes) is blind to them
