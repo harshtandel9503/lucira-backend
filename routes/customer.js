@@ -693,6 +693,14 @@ async function routes(fastify, options) {
                 currency: order.currency,
               }).format(order.total_price),
               product: repItem?.name || "Jewelry Item",
+              tags: order.tags || "",
+              noteAttributes: order.note_attributes || [],
+              isDgrp: Boolean(
+                (order.tags || "").includes("DGRP") ||
+                (order.tags || "").includes("LOCK_AND_KEY") ||
+                (order.note_attributes || []).some(na => (na.name || na.key) === "payment_gateway" && na.value === "DGRP") ||
+                (order.line_items || []).some(li => (li.name || li.title || "").includes("Lock & Key"))
+              ),
               image: (repItem?.product_id && productImages[repItem.product_id]) ? productImages[repItem.product_id] : "/images/product/1.jpg"
             };
           });
@@ -798,6 +806,36 @@ async function routes(fastify, options) {
           } catch (dbErr) {
             console.warn("[Backend /customer/orders/:id] Could not query custom order status:", dbErr.message);
           }
+
+          let dgrpPlan = null;
+          try {
+            const db = fastify.mongo.db;
+            if (db) {
+              const rawNoteAttrs = orderRaw.note_attributes || [];
+              const planCodeAttr = rawNoteAttrs.find(na => (na.name || na.key) === 'dgrp_plan_code');
+              const planCode = planCodeAttr?.value;
+
+              const dgrpConditions = [
+                { shopify_order_id: String(orderRaw.admin_graphql_api_id) },
+                { shopify_order_id: String(orderRaw.id) },
+                { shopify_order_name: String(orderRaw.name) },
+                { shopify_order_name: '#' + orderNumStr }
+              ];
+              if (planCode) dgrpConditions.push({ plan_code: planCode });
+
+              dgrpPlan = await db.collection('dgrp_plans').findOne({ $or: dgrpConditions });
+            }
+          } catch (dgrpErr) {
+            console.warn('[Backend /customer/orders/:id] Could not query dgrpPlan:', dgrpErr.message);
+          }
+
+          const isDgrp = Boolean(
+            dgrpPlan ||
+            (orderRaw.tags || '').includes('DGRP') ||
+            (orderRaw.tags || '').includes('LOCK_AND_KEY') ||
+            (orderRaw.note_attributes || []).some(na => (na.name || na.key) === 'payment_gateway' && na.value === 'DGRP') ||
+            (orderRaw.line_items || []).some(li => (li.name || li.title || '').includes('Lock & Key'))
+          );
 
           const customStatusText = customStatus?.status || customStatus?.reason_status_description;
           const normCustom = (customStatusText || "").toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -951,6 +989,12 @@ async function routes(fastify, options) {
             mtoDispatchDate,
             inStockDispatchDate,
             trackingInfo,
+            tags: orderRaw.tags || "",
+            note: orderRaw.note || "",
+            noteAttributes: orderRaw.note_attributes || [],
+            customAttributes: orderRaw.note_attributes || [],
+            isDgrp,
+            dgrpPlan: dgrpPlan || null,
             shippingAddress: orderRaw.shipping_address ? {
               firstName: orderRaw.shipping_address.first_name,
               lastName: orderRaw.shipping_address.last_name,

@@ -4,12 +4,14 @@
  * Implements:
  * 1. Product-specific gold price lock (10% advance).
  * 2. 6 Months EMI for Gold & Diamond, 3 Months EMI for Plain Gold.
- * 3. Razorpay payment creation & verification for Advance, Installments, and Pre-closure.
- * 4. Pre-closure discount calculation when gold rate drops.
- * 5. Admin & Customer APIs.
+ * 3. Shopify Draft Order creation when Razorpay checkout opens.
+ * 4. Shopify Order completion (Partially Paid) upon payment verification.
+ * 5. Pre-closure discount calculation when gold rate drops.
+ * 6. Admin & Customer APIs.
  */
 
 const crypto = require('crypto');
+const { shopifyAdminFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 
 function toSubunits(amount) {
   const numericAmount = Number(amount || 0);
@@ -24,6 +26,49 @@ function cleanPhone(raw) {
   if (digits.length === 10) return digits;
   if (digits.length > 10) return digits.slice(-10);
   return digits;
+}
+
+function normalizeVariantId(variantId = '') {
+  const value = String(variantId || '').trim();
+  if (!value) return '';
+  return value.includes('gid://shopify/ProductVariant/')
+    ? value
+    : `gid://shopify/ProductVariant/${value}`;
+}
+
+function getNumericShopifyId(gid = '') {
+  return String(gid || '').match(/\d+$/)?.[0] || '';
+}
+
+function asMoney(value) {
+  const amount = Number(value || 0);
+  return Number.isFinite(amount) ? amount.toFixed(2) : '0.00';
+}
+
+function buildDgrpMailingAddress(addr = null) {
+  if (!addr) return null;
+  const firstName = addr.first_name || addr.firstName || '';
+  const lastName = addr.last_name || addr.lastName || '';
+  const address1 = addr.address_line || addr.address1 || addr.address || '';
+  const address2 = addr.landmark || addr.address2 || '';
+  const city = addr.city || '';
+  const province = addr.state || addr.province || '';
+  const zip = addr.pincode || addr.zip || '';
+  const phone = cleanPhone(addr.mobile || addr.phone || '');
+  const company = addr.company ? (addr.gstin ? `${addr.company} (GSTIN: ${addr.gstin})` : addr.company) : '';
+
+  return {
+    firstName,
+    lastName,
+    company,
+    address1,
+    address2,
+    city,
+    province,
+    zip,
+    country: 'India',
+    phone: phone ? `+91${phone}` : '',
+  };
 }
 
 module.exports = async function (fastify) {
@@ -51,10 +96,10 @@ module.exports = async function (fastify) {
     }
   }
 
-  // ──────────────────────────────────────────────────────────────────────────
+  // =========================================================================
   // 1. GET /api/dgrp/config
   // Returns DGRP global settings and current live rates
-  // ──────────────────────────────────────────────────────────────────────────
+  // =========================================================================
   fastify.get('/config', async (request, reply) => {
     try {
       const db = fastify.mongo?.db;
@@ -92,10 +137,10 @@ module.exports = async function (fastify) {
     }
   });
 
-  // ──────────────────────────────────────────────────────────────────────────
+  // =========================================================================
   // 2. POST /api/dgrp/create-advance-order
-  // Creates Razorpay Order for 10% Advance Down Payment
-  // ──────────────────────────────────────────────────────────────────────────
+  // Creates Shopify Draft Order and Razorpay Order for 10% Advance Down Payment
+  // =========================================================================
   fastify.post('/create-advance-order', async (request, reply) => {
     try {
       const body = request.body || {};
@@ -112,8 +157,7 @@ module.exports = async function (fastify) {
         return reply.code(400).send({ error: 'Valid product price is required' });
       }
 
-      // Determine product type and tenure
-      // 6 months if Gold & Diamond; 3 months if Plain Gold
+      // Determine product type and tenure: 6 months if Gold & Diamond; 3 months if Plain Gold
       const isDiamond = body.is_diamond || product?.is_diamond || false;
       const tenure = isDiamond ? 6 : 3;
 
@@ -121,12 +165,127 @@ module.exports = async function (fastify) {
       const advanceAmount = Math.round((price * advancePercent) / 100);
       const remainingBalance = price - advanceAmount;
       const monthlyEmi = Math.round(remainingBalance / tenure);
+      const effectiveGoldRate = Number(locked_gold_rate) || (await getCurrentGoldRate());
 
       const amountInSubunits = toSubunits(advanceAmount);
-
       const receiptId = `dgrp_adv_${Date.now().toString(36)}`;
 
-      // Create Razorpay Order
+      // STEP 1: Create Shopify Draft Order with full line item properties & DGRP details
+      const lineItemCustomAttributes = [
+        { key: "_Shipping Date", value: String(product?.shippingDate || "") },
+        { key: "_Gold Price Per Gram", value: String(product?.goldPricePerGram || effectiveGoldRate || "") },
+        { key: "_Gold Weight", value: String(product?.goldWeight || product?.metal_weight || "") },
+        { key: "_Gold Price", value: String(product?.goldPrice || "") },
+        { key: "_Making Charges", value: String(product?.makingCharges || "") },
+        { key: "_Diamond Charges", value: String(product?.diamondCharges ?? "0") },
+        { key: "_GST", value: String(product?.gst || "") },
+        { key: "_Final Price", value: String(price) },
+        { key: "_Diamond Total Pcs", value: String(product?.diamondTotalPcs ?? "0") },
+        { key: "_Diamond Total Carat", value: String(product?.diamondTotalCarat || product?.diamond_carat || "0") },
+        { key: "Color", value: String(product?.color || product?.metal_color || "") },
+        { key: "Karat", value: String(product?.karat || product?.metal_purity || "") },
+        { key: "Size", value: String(product?.size || "") },
+        { key: "Variant Title", value: String(product?.variantTitle || "") },
+        { key: "_DGRP Locked Gold Rate", value: `₹${Number(effectiveGoldRate).toLocaleString("en-IN")}/gm` },
+        { key: "_DGRP 10% Advance", value: `₹${Number(advanceAmount).toLocaleString("en-IN")}` },
+        { key: "_DGRP Monthly Installment", value: `₹${Number(monthlyEmi).toLocaleString("en-IN")} x ${tenure} Months` },
+        { key: "_DGRP Tenure", value: `${tenure} Months` },
+      ].filter(attr => attr.value !== "" && attr.value !== "undefined");
+
+      const draftLineItem = {
+        quantity: 1,
+        originalUnitPrice: String(price),
+        customAttributes: lineItemCustomAttributes,
+      };
+
+      const variantGid = normalizeVariantId(product?.variantId || product?.id);
+      if (variantGid && !variantGid.endsWith('/null') && !variantGid.endsWith('/undefined')) {
+        draftLineItem.variantId = variantGid;
+      } else {
+        draftLineItem.title = product?.title || "Jewelry Item";
+      }
+
+      // Free Diamond Pendant allocated with DGRP
+      const freeGiftLineItem = {
+        title: "Free Diamond Pendant (Lock & Key)",
+        quantity: 1,
+        originalUnitPrice: "0.00",
+        appliedDiscount: {
+          title: "Free Diamond Pendant (Lock & Key)",
+          value: 100,
+          valueType: "PERCENTAGE",
+        },
+        customAttributes: [
+          { key: "_DGRP Benefit", value: "Free Diamond Pendant" },
+          { key: "Worth", value: "₹15,000" },
+        ],
+      };
+
+      const mailingAddress = buildDgrpMailingAddress(shipping_address);
+
+      const dgrpTags = ["Razorpay", "DGRP", "Lock & Key", "10% Advance"];
+      if (shipping_address?.delivery_method === "pickup") {
+        dgrpTags.push("Store Pickup");
+      }
+
+      const dgrpCustomAttributes = [
+        { key: "payment_gateway", value: "DGRP" },
+        { key: "dgrp_plan_type", value: "LOCK_AND_KEY" },
+        { key: "dgrp_locked_gold_rate", value: String(effectiveGoldRate) },
+        { key: "dgrp_advance_amount", value: String(advanceAmount) },
+        { key: "dgrp_monthly_emi", value: String(monthlyEmi) },
+        { key: "dgrp_tenure_months", value: String(tenure) },
+        { key: "dgrp_total_price", value: String(price) },
+        { key: "dgrp_pending_balance", value: String(remainingBalance) },
+        { key: "delivery_method", value: shipping_address?.delivery_method || "delivery" },
+      ];
+
+      const draftOrderInput = {
+        lineItems: [draftLineItem, freeGiftLineItem],
+        useCustomerDefaultAddress: false,
+        taxExempt: true,
+        shippingAddress: mailingAddress,
+        billingAddress: mailingAddress,
+        customAttributes: dgrpCustomAttributes,
+        tags: dgrpTags,
+        note: `Order created via Lock & Key (DGRP).\n10% Advance: ₹${Number(advanceAmount).toLocaleString("en-IN")}.\nRemaining Balance: ₹${Number(remainingBalance).toLocaleString("en-IN")} across ${tenure} monthly installments of ₹${Number(monthlyEmi).toLocaleString("en-IN")}.\nLocked 24KT Gold Rate: ₹${Number(effectiveGoldRate).toLocaleString("en-IN")}/gm.`
+      };
+
+      const customerEmail = customer?.email || shipping_address?.email;
+      if (customerEmail) {
+        draftOrderInput.email = customerEmail;
+      }
+
+      let draftOrder = null;
+      try {
+        const shopifyDraftData = await shopifyAdminFetch(`
+          mutation draftOrderCreate($input: DraftOrderInput!) {
+            draftOrderCreate(input: $input) {
+              draftOrder {
+                id
+                name
+                totalPrice
+              }
+              userErrors {
+                field
+                message
+              }
+            }
+          }
+        `, { input: draftOrderInput });
+
+        if (shopifyDraftData?.draftOrderCreate?.userErrors?.length) {
+          request.log.warn('Shopify Draft Order UserErrors in DGRP:', shopifyDraftData.draftOrderCreate.userErrors);
+        } else {
+          draftOrder = shopifyDraftData?.draftOrderCreate?.draftOrder || null;
+          request.log.info(`DGRP Draft Order created: ${draftOrder?.id} (${draftOrder?.name})`);
+        }
+      } catch (draftErr) {
+        request.log.error('Failed to create Shopify Draft Order in DGRP:', draftErr);
+      }
+
+      // STEP 2: Create Razorpay Order
+      const customerPhone = cleanPhone(customer?.mobile || shipping_address?.mobile || '');
       const razorpayRes = await fetch('https://api.razorpay.com/v1/orders', {
         method: 'POST',
         headers: {
@@ -141,7 +300,9 @@ module.exports = async function (fastify) {
             plan_type: 'DGRP_ADVANCE',
             product_title: product?.title || 'Jewelry Piece',
             tenure_months: String(tenure),
-            customer_mobile: cleanPhone(customer?.mobile || shipping_address?.mobile || '')
+            customer_mobile: customerPhone,
+            draft_id: draftOrder?.id || '',
+            draft_name: draftOrder?.name || '',
           }
         }),
       });
@@ -157,15 +318,50 @@ module.exports = async function (fastify) {
 
       const razorpayOrder = await razorpayRes.json();
 
+      // Save pending order session in MongoDB for robust verification
+      const db = fastify.mongo?.db;
+      if (db) {
+        try {
+          await db.collection('dgrp_pending_orders').updateOne(
+            { razorpay_order_id: razorpayOrder.id },
+            {
+              $set: {
+                receipt_id: receiptId,
+                draft_id: draftOrder?.id || null,
+                draft_name: draftOrder?.name || null,
+                razorpay_order_id: razorpayOrder.id,
+                amount_subunits: amountInSubunits,
+                advance_amount: advanceAmount,
+                product_price: price,
+                tenure_months: tenure,
+                monthly_installment: monthlyEmi,
+                locked_gold_rate: effectiveGoldRate,
+                is_diamond: isDiamond,
+                customer,
+                shipping_address,
+                product,
+                created_at: new Date()
+              }
+            },
+            { upsert: true }
+          );
+        } catch (dbErr) {
+          request.log.warn('Could not store dgrp_pending_orders record:', dbErr.message);
+        }
+      }
+
       return {
         key: keyId,
         orderId: razorpayOrder.id,
+        dgrpOrderId: receiptId,
+        draftId: draftOrder?.id || null,
+        draftOrderName: draftOrder?.name || null,
         amount: amountInSubunits,
         currency: 'INR',
         advance_amount: advanceAmount,
         monthly_installment: monthlyEmi,
         tenure_months: tenure,
-        locked_gold_rate: Number(locked_gold_rate) || (await getCurrentGoldRate()),
+        locked_gold_rate: effectiveGoldRate,
         original_price: price,
         receipt: receiptId
       };
@@ -175,19 +371,16 @@ module.exports = async function (fastify) {
     }
   });
 
-  // ──────────────────────────────────────────────────────────────────────────
+  // =========================================================================
   // 3. POST /api/dgrp/verify-advance-payment
-  // Verifies signature and creates the DGRP plan in MongoDB
-  // ──────────────────────────────────────────────────────────────────────────
+  // Verifies signature, completes Shopify Draft Order as Partially Paid, and saves DGRP plan
+  // =========================================================================
   fastify.post('/verify-advance-payment', async (request, reply) => {
     try {
       const body = request.body || {};
-      const {
-        razorpay_order_id,
-        razorpay_payment_id,
-        razorpay_signature,
-        plan_data
-      } = body;
+      const razorpay_order_id = body.razorpay_order_id || body.razorpayOrderId;
+      const razorpay_payment_id = body.razorpay_payment_id || body.razorpayPaymentId;
+      const razorpay_signature = body.razorpay_signature || body.razorpaySignature;
 
       if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
         return reply.code(400).send({ error: 'Missing payment signature or details' });
@@ -204,12 +397,148 @@ module.exports = async function (fastify) {
         return reply.code(500).send({ error: 'Database connection unavailable' });
       }
 
-      const tenure = Number(plan_data.tenure_months || (plan_data.is_diamond ? 6 : 3));
-      const price = Number(plan_data.original_price || 0);
-      const advanceAmount = Number(plan_data.advance_amount || Math.round(price * 0.10));
-      const monthlyEmi = Number(plan_data.monthly_installment || Math.round((price - advanceAmount) / tenure));
+      // Look up pending order from DB if available
+      let pendingOrder = null;
+      try {
+        pendingOrder = await db.collection('dgrp_pending_orders').findOne({ razorpay_order_id });
+      } catch (err) {
+        request.log.warn('Could not find pending DGRP order:', err.message);
+      }
 
-      // Generate Installments schedule
+      const planData = body.plan_data || pendingOrder || {};
+      const tenure = Number(planData.tenure_months || pendingOrder?.tenure_months || (planData.is_diamond ? 6 : 3) || 3);
+      const price = Number(planData.original_price || planData.product_price || pendingOrder?.product_price || 0);
+      const advanceAmount = Number(planData.advance_amount || pendingOrder?.advance_amount || Math.round(price * 0.10));
+      const monthlyEmi = Number(planData.monthly_installment || pendingOrder?.monthly_installment || Math.round((price - advanceAmount) / tenure));
+      const draftId = body.draftId || planData.draftId || pendingOrder?.draft_id || null;
+
+      const planCode = `DGRP-${Date.now().toString(36).toUpperCase()}-${Math.floor(100 + Math.random() * 900)}`;
+
+      // STEP 1: Complete Shopify Draft Order into a Shopify Order marked Partially Paid
+      let shopifyOrder = null;
+      if (draftId) {
+        try {
+          // Update draft order note attributes with verified payment details
+          await shopifyAdminFetch(`
+            mutation draftOrderUpdate($id: ID!, $input: DraftOrderInput!) {
+              draftOrderUpdate(id: $id, input: $input) {
+                draftOrder {
+                  id
+                }
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }
+          `, {
+            id: draftId,
+            input: {
+              customAttributes: [
+                { key: "payment_gateway", value: "DGRP" },
+                { key: "razorpay_order_id", value: String(razorpay_order_id) },
+                { key: "razorpay_payment_id", value: String(razorpay_payment_id) },
+                { key: "dgrp_plan_code", value: planCode },
+                { key: "dgrp_advance_amount", value: String(advanceAmount) },
+                { key: "dgrp_pending_balance", value: String(price - advanceAmount) },
+                { key: "dgrp_monthly_emi", value: String(monthlyEmi) },
+                { key: "dgrp_tenure_months", value: String(tenure) },
+                { key: "dgrp_locked_gold_rate", value: String(planData.locked_gold_rate || pendingOrder?.locked_gold_rate || "") },
+              ]
+            }
+          });
+
+          // Complete the Draft Order with paymentPending: true so it's created as Partially Paid / Payment Pending
+          const completeRes = await shopifyAdminFetch(`
+            mutation draftOrderComplete($id: ID!, $paymentPending: Boolean) {
+              draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+                draftOrder {
+                  id
+                  order {
+                    id
+                    name
+                    totalPriceSet {
+                      shopMoney {
+                        amount
+                        currencyCode
+                      }
+                    }
+                  }
+                }
+                userErrors {
+                  field
+                  message
+                }
+              }
+            }
+          `, { id: draftId, paymentPending: true });
+
+          const completedOrder = completeRes?.draftOrderComplete?.draftOrder?.order;
+          if (completedOrder) {
+            shopifyOrder = completedOrder;
+            request.log.info(`DGRP Draft Order ${draftId} completed into Order: ${completedOrder.name}`);
+
+            // Record manual payment for the 10% advance so financial status is "Partially paid"
+            try {
+              await shopifyAdminFetch(`
+                mutation orderCreateManualPayment($id: ID!, $amount: MoneyInput, $paymentMethodName: String, $processedAt: DateTime) {
+                  orderCreateManualPayment(
+                    id: $id,
+                    amount: $amount,
+                    paymentMethodName: $paymentMethodName,
+                    processedAt: $processedAt
+                  ) {
+                    order {
+                      id
+                      displayFinancialStatus
+                    }
+                    userErrors {
+                      field
+                      message
+                    }
+                  }
+                }
+              `, {
+                id: completedOrder.id,
+                amount: {
+                  amount: asMoney(advanceAmount),
+                  currencyCode: "INR",
+                },
+                paymentMethodName: `Razorpay DGRP 10% Advance (${razorpay_payment_id})`,
+                processedAt: new Date().toISOString(),
+              }, "2026-01");
+            } catch (manualPayErr) {
+              request.log.warn('GraphQL orderCreateManualPayment failed, trying REST:', manualPayErr.message);
+              const numericOrderId = getNumericShopifyId(completedOrder.id);
+              if (numericOrderId) {
+                await shopifyAdminRestFetch(
+                  `orders/${numericOrderId}/transactions.json`,
+                  {},
+                  {
+                    method: "POST",
+                    body: {
+                      transaction: {
+                        kind: "sale",
+                        status: "success",
+                        amount: asMoney(advanceAmount),
+                        currency: "INR",
+                        gateway: "Razorpay",
+                        authorization: razorpay_payment_id,
+                        source_name: "external",
+                        message: `10% Advance captured via Razorpay (${razorpay_payment_id})`,
+                      },
+                    },
+                  }
+                ).catch(e => request.log.warn('REST transaction fallback failed:', e.message));
+              }
+            }
+          }
+        } catch (draftErr) {
+          request.log.error('Error completing draft order in DGRP:', draftErr);
+        }
+      }
+
+      // STEP 2: Generate Installments schedule & Save Plan in MongoDB
       const now = new Date();
       const installments = [
         {
@@ -241,51 +570,56 @@ module.exports = async function (fastify) {
         });
       }
 
-      const planCode = `DGRP-${Date.now().toString(36).toUpperCase()}-${Math.floor(100 + Math.random() * 900)}`;
-
+      const shippingAddress = planData.shipping_address || pendingOrder?.shipping_address || {};
+      const customerObj = planData.customer || pendingOrder?.customer || {};
       const customerMobile = cleanPhone(
-        plan_data.customer?.mobile ||
-        plan_data.shipping_address?.mobile ||
-        plan_data.customer?.phone || ''
+        customerObj.mobile ||
+        shippingAddress.mobile ||
+        customerObj.phone || ''
       );
+
+      const productObj = planData.product || pendingOrder?.product || {};
 
       const dgrpDoc = {
         plan_code: planCode,
+        shopify_draft_order_id: draftId,
+        shopify_order_id: shopifyOrder?.id || null,
+        shopify_order_name: shopifyOrder?.name || null,
         customer: {
-          user_id: plan_data.customer?.user_id || plan_data.customer?.id || null,
-          email: plan_data.customer?.email || plan_data.shipping_address?.email || '',
+          user_id: customerObj.user_id || customerObj.id || null,
+          email: customerObj.email || shippingAddress.email || '',
           mobile: customerMobile,
-          first_name: plan_data.shipping_address?.first_name || plan_data.customer?.first_name || '',
-          last_name: plan_data.shipping_address?.last_name || plan_data.customer?.last_name || ''
+          first_name: shippingAddress.first_name || customerObj.first_name || '',
+          last_name: shippingAddress.last_name || customerObj.last_name || ''
         },
         shipping_address: {
-          delivery_method: plan_data.shipping_address?.delivery_method || 'delivery',
-          is_company: !!plan_data.shipping_address?.is_company,
-          first_name: plan_data.shipping_address?.first_name || '',
-          last_name: plan_data.shipping_address?.last_name || '',
-          address_line: plan_data.shipping_address?.address_line || plan_data.shipping_address?.address || '',
-          landmark: plan_data.shipping_address?.landmark || '',
-          city: plan_data.shipping_address?.city || '',
-          state: plan_data.shipping_address?.state || '',
-          pincode: plan_data.shipping_address?.pincode || '',
-          country: plan_data.shipping_address?.country || 'India',
+          delivery_method: shippingAddress.delivery_method || 'delivery',
+          is_company: !!shippingAddress.is_company,
+          first_name: shippingAddress.first_name || '',
+          last_name: shippingAddress.last_name || '',
+          address_line: shippingAddress.address_line || shippingAddress.address || '',
+          landmark: shippingAddress.landmark || '',
+          city: shippingAddress.city || '',
+          state: shippingAddress.state || '',
+          pincode: shippingAddress.pincode || '',
+          country: shippingAddress.country || 'India',
           mobile: customerMobile,
-          email: plan_data.shipping_address?.email || plan_data.customer?.email || ''
+          email: shippingAddress.email || customerObj.email || ''
         },
         product: {
-          product_id: plan_data.product?.id || plan_data.product?.shopifyId || '',
-          variant_id: plan_data.product?.variantId || plan_data.product?.activeVariantId || '',
-          title: plan_data.product?.title || 'Jewelry Piece',
-          image: plan_data.product?.image || '',
-          sku: plan_data.product?.sku || '',
-          metal_purity: plan_data.product?.metal_purity || '18KT',
-          metal_color: plan_data.product?.metal_color || 'Yellow Gold',
-          metal_weight: Number(plan_data.product?.metal_weight || 2.5),
-          diamond_carat: Number(plan_data.product?.diamond_carat || 0),
-          product_type: plan_data.is_diamond ? 'gold_diamond' : 'gold_only'
+          product_id: productObj.id || productObj.product_id || productObj.shopifyId || '',
+          variant_id: productObj.variantId || productObj.variant_id || '',
+          title: productObj.title || 'Jewelry Piece',
+          image: productObj.image || '',
+          sku: productObj.sku || '',
+          metal_purity: productObj.karat || productObj.metal_purity || '18KT',
+          metal_color: productObj.color || productObj.metal_color || 'Yellow Gold',
+          metal_weight: Number(productObj.goldWeight || productObj.metal_weight || 2.5),
+          diamond_carat: Number(productObj.diamondTotalCarat || productObj.diamond_carat || 0),
+          product_type: (planData.is_diamond || pendingOrder?.is_diamond) ? 'gold_diamond' : 'gold_only'
         },
         financials: {
-          locked_gold_rate: Number(plan_data.locked_gold_rate || (await getCurrentGoldRate())),
+          locked_gold_rate: Number(planData.locked_gold_rate || pendingOrder?.locked_gold_rate || (await getCurrentGoldRate())),
           original_product_price: price,
           advance_percentage: 10,
           advance_amount: advanceAmount,
@@ -293,7 +627,7 @@ module.exports = async function (fastify) {
           monthly_installment: monthlyEmi,
           total_paid: advanceAmount,
           amount_pending: price - advanceAmount,
-          status: 'active' // 'active' | 'completed' | 'pre_closed' | 'overdue' | 'cancelled'
+          status: 'active'
         },
         installments,
         pre_closure: {
@@ -319,6 +653,8 @@ module.exports = async function (fastify) {
         success: true,
         plan_id: result.insertedId,
         plan_code: planCode,
+        shopify_order_id: shopifyOrder?.id || null,
+        shopify_order_name: shopifyOrder?.name || null,
         message: 'Lock & Key plan successfully enrolled!'
       };
     } catch (error) {
@@ -327,10 +663,9 @@ module.exports = async function (fastify) {
     }
   });
 
-  // ──────────────────────────────────────────────────────────────────────────
+  // =========================================================================
   // 4. GET /api/dgrp/user-plans
-  // Fetches customer's active and completed plans with live rates comparison
-  // ──────────────────────────────────────────────────────────────────────────
+  // =========================================================================
   fastify.get('/user-plans', async (request, reply) => {
     try {
       const db = fastify.mongo?.db;
@@ -573,7 +908,7 @@ module.exports = async function (fastify) {
         today_gold_rate: currentGoldRate,
         metal_weight_grams: metalWeight,
         original_price: originalPrice,
-        gold_savings,
+        gold_savings: goldSavings,
         adjusted_price: newPrice,
         total_paid_so_far: totalPaid,
         pending_preclose_amount: pendingToPay,
@@ -652,7 +987,7 @@ module.exports = async function (fastify) {
         currency: 'INR',
         plan_id,
         pending_amount: pendingAmount,
-        gold_savings,
+        gold_savings: goldSavings,
         adjusted_price: newPrice
       };
     } catch (error) {
