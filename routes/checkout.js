@@ -120,8 +120,59 @@ function buildRestMailingAddress(address = null) {
   };
 }
 
+function resolveOrderStatus(item = {}, variant = null) {
+  // 1. Explicitly provided on item or item.properties
+  const explicit = item.orderStatus 
+    || item.order_status 
+    || item.properties?.["Order Status"] 
+    || item.properties?.["order_status"]
+    || item.properties?.["_Order Status"];
+  if (explicit && String(explicit).trim()) {
+    const upper = String(explicit).trim().toUpperCase();
+    if (upper === "RTS" || upper === "READY TO SHIP" || upper === "READY_TO_SHIP") return "RTS";
+    if (upper === "MTO" || upper === "MADE TO ORDER" || upper === "MADE_TO_ORDER") return "MTO";
+    return upper;
+  }
+
+  // 2. Custom Build-Your-Own jewelry is ALWAYS Made-To-Order
+  if (item.properties?.["_byj_preview"] || item.properties?.["_byj_charms_json"]) {
+    return "MTO";
+  }
+
+  // 3. Insurance is Ready-To-Ship / In-Stock
+  const title = String(item.title || item.name || "").toLowerCase();
+  const sku = String(item.sku || "").toLowerCase();
+  if (item.isInsurance || title.includes("insurance") || sku.includes("ins")) {
+    return "RTS";
+  }
+
+  // 4. Free gift / Gold coin is Ready-To-Ship
+  if (item.isFreeGift || item.isGoldCoin || item.isSilverPendant) {
+    return "RTS";
+  }
+
+  // 5. item.inStock flag (from client or DB cart)
+  if (item.inStock !== undefined && item.inStock !== null) {
+    return (item.inStock === true || item.inStock === "true") ? "RTS" : "MTO";
+  }
+
+  // 6. Variant inventory from Shopify if available
+  if (variant && typeof variant.inventoryQuantity === "number") {
+    return variant.inventoryQuantity > 0 ? "RTS" : "MTO";
+  }
+
+  // 7. Fallback based on leadTime: <= 2 is RTS, else MTO
+  if (item.leadTime && Number(item.leadTime) > 3) {
+    return "MTO";
+  }
+
+  return "MTO";
+}
+
 function buildLineItemProperties(item = {}) {
+  const orderStatus = resolveOrderStatus(item);
   const pairs = [
+    ["Order Status", orderStatus],
     ["EngravingText", item.engravingText || item.engraving || ""],
     ["EngravingFont", item.engravingFont || ""],
     ["GiftText", item.giftText || ""],
@@ -144,7 +195,9 @@ function buildLineItemProperties(item = {}) {
 
   if (item.properties && typeof item.properties === 'object') {
     for (const [k, v] of Object.entries(item.properties)) {
-      pairs.push([k, v]);
+      if (k !== "Order Status" && k !== "order_status") {
+        pairs.push([k, v]);
+      }
     }
   }
 
@@ -613,6 +666,8 @@ async function routes(fastify, options) {
             engravingFont: incomingItem.engravingFont || "",
             giftText: incomingItem.giftText || "",
             shippingDate: incomingItem.shippingDate || "",
+            inStock: incomingItem.inStock,
+            orderStatus: incomingItem.orderStatus || resolveOrderStatus(incomingItem),
             color: incomingItem.color || "",
             karat: incomingItem.karat || "",
             size: incomingItem.size || "",
@@ -645,6 +700,16 @@ async function routes(fastify, options) {
 
             if (match.shippingDate && dbItem.shippingDate !== match.shippingDate) {
               updatedItem = { ...updatedItem, shippingDate: match.shippingDate };
+              enriched = true;
+            }
+
+            if (match.orderStatus && dbItem.orderStatus !== match.orderStatus) {
+              updatedItem = { ...updatedItem, orderStatus: match.orderStatus };
+              enriched = true;
+            }
+
+            if (match.inStock !== undefined && dbItem.inStock !== match.inStock) {
+              updatedItem = { ...updatedItem, inStock: match.inStock };
               enriched = true;
             }
 
@@ -1092,17 +1157,20 @@ async function routes(fastify, options) {
         const originalValue = Number(item.originalPrice || item.comparePrice || 0);
         const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
 
+        const orderStatus = resolveOrderStatus(item);
         const staticAttributes = [
+          { key: "Order Status", value: orderStatus },
           { key: "_Gold Weight", value: String(item.goldWeight || "") },
           { key: "_Gold Price", value: String(item.goldPrice || "") },
           { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
           { key: "_Making Charges", value: String(item.makingCharges || "") },
           { key: "_Diamond Charges", value: String(item.diamondCharges || "") },
           { key: "_Diamond Total Pcs", value: String(item.diamondTotalPcs || "") },
+          { key: "_Diamond Total Carat", value: String(item.diamondCarat || "") },
           { key: "_GST", value: String(item.gst || "") },
           { key: "_Final Price", value: String(item.finalPrice || item.price || "") },
           { key: "_Shipping Date", value: String(item.shippingDate || "") },
-          { key: "Variant Title", value: price === 0 ? "Free Gift" : String(item.variantTitle || "") },
+          { key: "Variant Title", value: price === 0 ? "Free Gift" : (isGoldCoin || isSilverPendant ? (eligibleGiftTier?.title || "Free Gift") : String(item.variantTitle || "")) },
           { key: "Color", value: String(item.color || "") },
           { key: "Karat", value: String(item.karat || "") },
           { key: "Size", value: String(item.size || "") },
@@ -1115,7 +1183,7 @@ async function routes(fastify, options) {
         const dynamicAttributes = [];
         if (item.properties) {
           for (const [key, val] of Object.entries(item.properties)) {
-            if (val && typeof val === 'string' && !key.startsWith('_byj_preview') && !key.startsWith('_byj_charms_json')) {
+            if (val && typeof val === 'string' && key !== "Order Status" && key !== "order_status" && !key.startsWith('_byj_preview') && !key.startsWith('_byj_charms_json')) {
               dynamicAttributes.push({ key, value: String(val) });
             }
           }
@@ -1127,26 +1195,7 @@ async function routes(fastify, options) {
         const lineItem = {
           quantity: Number(item.quantity || 1),
           originalUnitPrice: isGoldCoin ? 0 : (isSilverPendant ? String(giftVariantLivePrice || unitPrice || 0) : unitPrice),
-          customAttributes: [
-            { key: "_Gold Weight", value: String(item.goldWeight || "") },
-            { key: "_Gold Price", value: String(item.goldPrice || "") },
-            { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
-            { key: "_Making Charges", value: String(item.makingCharges || "") },
-            { key: "_Diamond Charges", value: String(item.diamondCharges || "") },
-            { key: "_Diamond Total Pcs", value: String(item.diamondTotalPcs || "") },
-            { key: "_Diamond Total Carat", value: String(item.diamondCarat || "") },
-            { key: "_GST", value: String(item.gst || "") },
-            { key: "_Final Price", value: String(item.finalPrice || item.price || "") },
-            { key: "_Shipping Date", value: String(item.shippingDate || "") },
-            { key: "Variant Title", value: isGoldCoin || isSilverPendant ? (eligibleGiftTier?.title || "Free Gift") : String(item.variantTitle || "") },
-            { key: "Color", value: String(item.color || "") },
-            { key: "Karat", value: String(item.karat || "") },
-            { key: "Size", value: String(item.size || "") },
-            { key: "EngravingText", value: String(item.engravingText || item.engraving || "") },
-            { key: "EngravingFont", value: String(item.engravingFont || "") },
-            { key: "GiftText", value: String(item.giftText || "") },
-            { key: "_gclid", value: String(gclid || "") },
-          ].filter(attr => attr.value !== "" && attr.value !== "0" && attr.value !== "undefined")
+          customAttributes,
         };
 
         if (isGoldCoin) {
