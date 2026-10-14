@@ -471,6 +471,57 @@ async function routes(fastify, options) {
       return reply.code(500).send({ error: err.message });
     }
   });
+
+  // POST /api/webhooks/shopify/orders/cancelled
+  fastify.post('/shopify/orders/cancelled', async (request, reply) => {
+    if (!verifyShopifyHmac(request)) {
+      console.warn('[Webhook orders/cancelled] Invalid or missing HMAC signature.');
+      return reply.code(401).send({ error: 'Unauthorized webhook' });
+    }
+
+    reply.code(200).send({ success: true, message: 'Cancellation webhook received' });
+
+    try {
+      const payload = request.body || {};
+      const orderId = payload.admin_graphql_api_id || (payload.id ? `gid://shopify/Order/${payload.id}` : null);
+      const orderName = payload.name;
+      const cancelledAt = payload.cancelled_at || new Date().toISOString();
+      const cancelReason = payload.cancel_reason || 'Cancelled in Shopify';
+
+      const db = fastify.mongo?.db;
+      if (db && (orderId || orderName)) {
+        const query = {
+          $or: [
+            ...(orderId ? [{ shopify_order_id: String(orderId) }] : []),
+            ...(orderName ? [{ shopify_order_name: String(orderName) }] : [])
+          ]
+        };
+
+        const result = await db.collection('dgrp_plans').updateMany(query, {
+          $set: {
+            'financials.status': 'cancelled',
+            'cancellation': {
+              is_cancelled: true,
+              cancelled_at: cancelledAt,
+              cancel_reason: cancelReason
+            },
+            updated_at: new Date()
+          }
+        });
+
+        // Also mark pending installments as cancelled
+        await db.collection('dgrp_plans').updateMany(
+          { ...query, 'installments.status': 'pending' },
+          { $set: { 'installments.$[elem].status': 'cancelled' } },
+          { arrayFilters: [{ 'elem.status': 'pending' }] }
+        );
+
+        console.log(`[Webhook orders/cancelled] Updated DGRP plans for ${orderName || orderId}: matched ${result.matchedCount}`);
+      }
+    } catch (err) {
+      console.error('[Webhook orders/cancelled] Processing error:', err);
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
