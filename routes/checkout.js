@@ -120,8 +120,27 @@ function buildRestMailingAddress(address = null) {
   };
 }
 
+function resolveOrderStatus(item = {}) {
+  if (item.orderStatus === "RTS" || item.orderStatus === "MTO") {
+    return item.orderStatus;
+  }
+  if (item.properties?.["Order Status"] === "RTS" || item.properties?.["Order Status"] === "MTO") {
+    return item.properties["Order Status"];
+  }
+  if (item.properties?.["_Order Status"] === "RTS" || item.properties?.["_Order Status"] === "MTO") {
+    return item.properties["_Order Status"];
+  }
+  if (item.properties?.["_byj_preview"]) {
+    return "MTO";
+  }
+  const isRTS = (item.inStock === true || item.inStock === "true" || item.inStock === 1);
+  return isRTS ? "RTS" : "MTO";
+}
+
 function buildLineItemProperties(item = {}) {
+  const orderStatus = resolveOrderStatus(item);
   const pairs = [
+    ["Order Status", orderStatus],
     ["EngravingText", item.engravingText || item.engraving || ""],
     ["EngravingFont", item.engravingFont || ""],
     ["GiftText", item.giftText || ""],
@@ -613,6 +632,8 @@ async function routes(fastify, options) {
             engravingFont: incomingItem.engravingFont || "",
             giftText: incomingItem.giftText || "",
             shippingDate: incomingItem.shippingDate || "",
+            orderStatus: incomingItem.orderStatus || resolveOrderStatus(incomingItem),
+            inStock: incomingItem.inStock,
             color: incomingItem.color || "",
             karat: incomingItem.karat || "",
             size: incomingItem.size || "",
@@ -645,6 +666,14 @@ async function routes(fastify, options) {
 
             if (match.shippingDate && dbItem.shippingDate !== match.shippingDate) {
               updatedItem = { ...updatedItem, shippingDate: match.shippingDate };
+              enriched = true;
+            }
+            if (match.orderStatus && dbItem.orderStatus !== match.orderStatus) {
+              updatedItem = { ...updatedItem, orderStatus: match.orderStatus };
+              enriched = true;
+            }
+            if (match.inStock !== undefined && dbItem.inStock !== match.inStock) {
+              updatedItem = { ...updatedItem, inStock: match.inStock };
               enriched = true;
             }
 
@@ -1092,7 +1121,10 @@ async function routes(fastify, options) {
         const originalValue = Number(item.originalPrice || item.comparePrice || 0);
         const unitPrice = (price === 0 && originalValue > 0) ? originalValue : price;
 
+        const orderStatus = resolveOrderStatus(item);
+
         const staticAttributes = [
+          { key: "Order Status", value: orderStatus },
           { key: "_Gold Weight", value: String(item.goldWeight || "") },
           { key: "_Gold Price", value: String(item.goldPrice || "") },
           { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
@@ -1128,6 +1160,7 @@ async function routes(fastify, options) {
           quantity: Number(item.quantity || 1),
           originalUnitPrice: isGoldCoin ? 0 : (isSilverPendant ? String(giftVariantLivePrice || unitPrice || 0) : unitPrice),
           customAttributes: [
+            { key: "Order Status", value: orderStatus },
             { key: "_Gold Weight", value: String(item.goldWeight || "") },
             { key: "_Gold Price", value: String(item.goldPrice || "") },
             { key: "_Gold Price Per Gram", value: String(item.goldPricePerGram || "") },
