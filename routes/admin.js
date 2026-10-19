@@ -308,7 +308,12 @@ async function routes(fastify, options) {
             'try_at_home_click', 
             'scratch_card_view', 
             'spin_wheel_view', 
-            'wheel_view'
+            'wheel_view',
+            'atc_login_view',
+            'cart_login_view',
+            'shipping_login_view',
+            'direct_login_view',
+            'auth_modal_view'
           ] 
         };
       }
