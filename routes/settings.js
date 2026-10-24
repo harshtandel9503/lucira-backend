@@ -39,6 +39,16 @@ const PLP_BANNER_DEFAULTS = {
       mobileImage: `${SHOPIFY_CDN}/Offer-Mobile1.jpg?v=1787998995`,
       alt: 'Offers',
     },
+    plainGold: {
+      desktopImage: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/gold_ring_plp.jpg?v=1792042102&width=1920',
+      mobileImage: 'https://cdn.shopify.com/s/files/1/0739/8516/3482/files/gold_ring_plp.jpg?v=1792042102&width=1920',
+      alt: 'Plain Gold Jewellery Offers',
+      handles: [
+        'plain-gold-rings', 'plain-gold-earrings', 'plain-gold-chains', 'plain-gold-necklaces', 'plain-gold-coins', 'plain-gold-nose-rings',
+        'gold-jewelry', 'gold-rings', 'gold-chains', 'gold-earrings', 'gold-bracelets', 'gold-necklaces', 'gold-coins',
+        '1-gram-gold-jewellery', '10-gram-gold-jewellery', '14k-gold-jewellery', '18k-gold-jewellery', '22k-gold-jewellery'
+      ],
+    },
     overrides: [
       // Full-width creatives that replace the default pink layout.
       { id: 'ov_eterna', handles: ['eterna'], layout: 'fullwidth', alt: 'Embrace',
@@ -188,6 +198,7 @@ async function routes(fastify, options) {
     }).catch(() => {});
 
     const handles = [...new Set([
+      ...(value?.topBanner?.plainGold?.handles || []),
       ...(value?.topBanner?.overrides || []).flatMap((o) => o.handles || []),
       ...(value?.inpageBanners || []).flatMap((b) => b.handles || []),
     ])];
@@ -445,6 +456,7 @@ async function routes(fastify, options) {
     return {
       topBanner: {
         default: stored?.topBanner?.default || PLP_BANNER_DEFAULTS.topBanner.default,
+        plainGold: stored?.topBanner?.plainGold || PLP_BANNER_DEFAULTS.topBanner.plainGold,
         overrides: Array.isArray(stored?.topBanner?.overrides)
           ? stored.topBanner.overrides
           : PLP_BANNER_DEFAULTS.topBanner.overrides,
@@ -475,6 +487,14 @@ async function routes(fastify, options) {
           desktopImage: str(topBanner.default?.desktopImage),
           mobileImage: str(topBanner.default?.mobileImage),
           alt: str(topBanner.default?.alt),
+        },
+        plainGold: {
+          desktopImage: str(topBanner.plainGold?.desktopImage || PLP_BANNER_DEFAULTS.topBanner.plainGold.desktopImage),
+          mobileImage: str(topBanner.plainGold?.mobileImage || PLP_BANNER_DEFAULTS.topBanner.plainGold.mobileImage),
+          alt: str(topBanner.plainGold?.alt || 'Plain Gold Jewellery Offers'),
+          handles: Array.isArray(topBanner.plainGold?.handles)
+            ? topBanner.plainGold.handles.map(str).filter(Boolean)
+            : PLP_BANNER_DEFAULTS.topBanner.plainGold.handles,
         },
         overrides: topBanner.overrides.map((o, i) => ({
           id: str(o.id) || `ov_${Date.now()}_${i}`,

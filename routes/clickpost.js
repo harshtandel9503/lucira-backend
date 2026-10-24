@@ -6,13 +6,14 @@
 
 const { shopifyAdminRestFetch } = require('../lib/shopify');
 
-const CLICKPOST_USERNAME = process.env.CLICKPOST_USERNAME || 'lucirajewels-test';
-const CLICKPOST_KEY = process.env.CLICKPOST_API_KEY || process.env.CLICKPOST_KEY || '334a7fc0-598e-45d9-b599-455dea42da45';
-const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '2f6fe169-505f-47d8-bf14-da099427c840';
+const CLICKPOST_USERNAME = process.env.CLICKPOST_USERNAME || '';
+const CLICKPOST_KEY = process.env.CLICKPOST_API_KEY || process.env.CLICKPOST_KEY || '';
+const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '';
 
-function buildClickPostTrackingUrl(waybill, cpId = 5) {
+function buildClickPostTrackingUrl(waybill, cpId) {
   if (!waybill) return null;
-  return `https://track.clickpost.in/?waybill=${encodeURIComponent(waybill)}&source=dashboard&cp_id=${encodeURIComponent(cpId)}&security_key=${encodeURIComponent(CLICKPOST_SECURITY_KEY)}`;
+  const cpParam = cpId ? `&cp_id=${encodeURIComponent(cpId)}` : '';
+  return `https://lucirajewelry.clickpost.in/en?waybill=${encodeURIComponent(waybill)}&source=dashboard${cpParam}`;
 }
 
 async function routes(fastify, options) {
@@ -26,7 +27,7 @@ async function routes(fastify, options) {
       const queryWaybill = request.query.waybill ? String(request.query.waybill).trim() : null;
 
       let waybill = queryWaybill;
-      let cpId = request.query.cp_id || request.query.cpId || 5;
+      let cpId = request.query.cp_id || request.query.cpId || null;
       let courierName = null;
       let trackingUrl = null;
       let customStatus = null;
@@ -94,7 +95,7 @@ async function routes(fastify, options) {
         };
       }
 
-      const finalClickpostUrl = trackingUrl || buildClickPostTrackingUrl(waybill, cpId || 5) || (CLICKPOST_USERNAME ? `https://${CLICKPOST_USERNAME}.clickpost.in/?waybill=${encodeURIComponent(waybill)}` : `https://track.clickpost.in/?waybill=${encodeURIComponent(waybill)}`);
+      const finalClickpostUrl = trackingUrl || buildClickPostTrackingUrl(waybill, cpId);
 
       let trackingResult = null;
 

@@ -6,11 +6,12 @@
 const { shopifyAdminFetch, shopifyStorefrontFetch, shopifyAdminRestFetch } = require('../lib/shopify');
 const returnsLib = require('../lib/returns');
 
-const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '2f6fe169-505f-47d8-bf14-da099427c840';
+const CLICKPOST_SECURITY_KEY = process.env.CLICKPOST_SECURITY_KEY || '';
 
-function getClickPostTrackingUrl(waybill, cpId = 5) {
+function getClickPostTrackingUrl(waybill, cpId) {
   if (!waybill) return '';
-  return `https://track.clickpost.in/?waybill=${encodeURIComponent(waybill)}&source=dashboard&cp_id=${encodeURIComponent(cpId)}&security_key=${encodeURIComponent(CLICKPOST_SECURITY_KEY)}`;
+  const cpParam = cpId ? `&cp_id=${encodeURIComponent(cpId)}` : '';
+  return `https://lucirajewelry.clickpost.in/en?waybill=${encodeURIComponent(waybill)}&source=dashboard${cpParam}`;
 }
 
 const ADDRESS_FIELDS = `
@@ -876,23 +877,24 @@ async function routes(fastify, options) {
           }
 
           let trackingInfo = null;
+          const cpId = customStatus?.clickpost_courier_partner_id || customStatus?.cp_id || customStatus?.courier_partner_id || null;
           if (orderRaw.fulfillments && orderRaw.fulfillments.length > 0) {
             const f = orderRaw.fulfillments[0];
             const wb = f.tracking_number || (f.tracking_numbers && f.tracking_numbers[0]) || "";
+            const fulfillmentCpId = cpId || f.courier_partner_id || null;
             trackingInfo = {
               waybill: wb,
-              courier: f.tracking_company || "Bluedart",
-              trackingUrl: f.tracking_url || getClickPostTrackingUrl(wb, 5),
+              courier: f.tracking_company || customStatus?.courier_name || "Bluedart",
+              trackingUrl: getClickPostTrackingUrl(wb, fulfillmentCpId),
               status: f.shipment_status || ""
             };
           }
-          if (!trackingInfo?.waybill && (customStatus?.waybill || customStatus?.awb || customStatus?.awbNo)) {
-            const wb = customStatus.waybill || customStatus.awb || customStatus.awbNo;
-            const cpId = customStatus.clickpost_courier_partner_id || customStatus.cp_id || 5;
+          if (!trackingInfo?.waybill && (customStatus?.clickpost_waybill || customStatus?.waybill || customStatus?.awb || customStatus?.awbNo)) {
+            const wb = customStatus.clickpost_waybill || customStatus.waybill || customStatus.awb || customStatus.awbNo;
             trackingInfo = {
               waybill: wb,
-              courier: customStatus.courier || customStatus.carrier || "Bluedart",
-              trackingUrl: customStatus.trackingUrl || getClickPostTrackingUrl(wb, cpId),
+              courier: customStatus.courier || customStatus.carrier || customStatus.courier_name || "Bluedart",
+              trackingUrl: getClickPostTrackingUrl(wb, cpId),
               status: customStatus.shipment_status || ""
             };
           }
@@ -904,7 +906,7 @@ async function routes(fastify, options) {
               trackingInfo = {
                 waybill: wb,
                 courier: "Bluedart",
-                trackingUrl: getClickPostTrackingUrl(wb, 5),
+                trackingUrl: getClickPostTrackingUrl(wb, cpId),
                 status: "Pre-Booked"
               };
             }
@@ -913,7 +915,7 @@ async function routes(fastify, options) {
             trackingInfo = {
               waybill: '58171190000',
               courier: 'Bluedart',
-              trackingUrl: getClickPostTrackingUrl('58171190000', 5),
+              trackingUrl: getClickPostTrackingUrl('58171190000', cpId),
               status: 'Order Placed'
             };
           }
@@ -984,20 +986,19 @@ async function routes(fastify, options) {
             documentDate: customStatus?.documentDate || null,
             statusHistory: customStatus?.history || [],
             fulfillmentStatus: orderRaw.fulfillment_status || (isCancelled ? 'CANCELLED' : 'UNFULFILLED'),
-            fulfillments: (orderRaw.fulfillments || []).map(f => ({
-              id: f.id,
-              status: f.status,
-              trackingCompany: f.tracking_company,
-              trackingNumber: f.tracking_number,
-              trackingNumbers: f.tracking_numbers || (f.tracking_number ? [f.tracking_number] : []),
-              trackingUrl: f.tracking_url,
-              trackingUrls: f.tracking_urls || (f.tracking_url ? [f.tracking_url] : [])
-            })),
-            trackingInfo: {
-              waybill: customStatus?.clickpost_waybill || customStatus?.waybill || customStatus?.awb || customStatus?.tracking_number || orderRaw.fulfillments?.[0]?.tracking_number || null,
-              trackingUrl: customStatus?.tracking_url || orderRaw.fulfillments?.[0]?.tracking_url || null,
-              courier: customStatus?.courier_name || orderRaw.fulfillments?.[0]?.tracking_company || null
-            },
+            fulfillments: (orderRaw.fulfillments || []).map(f => {
+              const wb = f.tracking_number || (f.tracking_numbers && f.tracking_numbers[0]) || "";
+              const fulfillmentCpId = cpId || f.courier_partner_id || null;
+              return {
+                id: f.id,
+                status: f.status,
+                trackingCompany: f.tracking_company,
+                trackingNumber: f.tracking_number,
+                trackingNumbers: f.tracking_numbers || (f.tracking_number ? [f.tracking_number] : []),
+                trackingUrl: wb ? getClickPostTrackingUrl(wb, fulfillmentCpId) : f.tracking_url,
+                trackingUrls: wb ? [getClickPostTrackingUrl(wb, fulfillmentCpId)] : (f.tracking_urls || (f.tracking_url ? [f.tracking_url] : []))
+              };
+            }),
             financialStatus: orderRaw.financial_status || 'PENDING',
             totalPrice: { amount: orderRaw.total_price, currencyCode: orderRaw.currency },
             subtotalPrice: { amount: orderRaw.subtotal_price, currencyCode: orderRaw.currency },

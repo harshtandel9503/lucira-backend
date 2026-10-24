@@ -1,6 +1,6 @@
 const fetch = require('node-fetch');
 
-const STOREFRONT_TOKEN = "ee913f570a7f3d4b45a8bf576a0dd123";
+const STOREFRONT_TOKEN = "2f5e3f91e92ad4d277735b2d63b854bf";
 const SHOPIFY_DOMAIN = "luciraonline.myshopify.com";
 
 const query = `
