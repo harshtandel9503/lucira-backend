@@ -563,6 +563,18 @@ async function routes(fastify, options) {
           };
         }
 
+        // For express collections (lucira-express / fast-shipping), only products with at
+        // least one published variant in stock should appear. Shopify smart collections evaluate
+        // variant inventory > 0 across ALL variants, including unpublished or draft variants.
+        // If a product has 0 in-stock published variants, drop it so out-of-stock products
+        // are never displayed in express delivery.
+        if (handle === "lucira-express" || handle === "fast-shipping") {
+          productsData.edges = productsData.edges.filter(({ node }) => {
+            const allVariants = node.variants?.edges || [];
+            return allVariants.some(({ node: v }) => v.availableForSale === true && v.currentlyNotInStock === false);
+          });
+        }
+
         // A product card shows ONE variant, so a ring's ~80 size × colour × purity
         // variants are cut down before anything is priced or sent. Kept: the
         // first variant, plus, per metal colour, the first one in stock (or the
@@ -779,6 +791,10 @@ async function routes(fastify, options) {
           filteredProducts = products.filter(p => {
             return p.price >= min && p.price <= max;
           });
+        }
+
+        if (handle === "lucira-express" || handle === "fast-shipping") {
+          filteredProducts = filteredProducts.filter(p => p.variants?.some(v => v.inStock));
         }
 
         let totalProducts = 0;
